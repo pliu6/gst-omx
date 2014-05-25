@@ -35,6 +35,7 @@ libgstomx_la_SOURCES = \
 
 noinst_HEADERS = \
 	gstomx.h \
+	gstomxbufferpool.h \
 	gstomxvideo.h \
 	gstomxvideodec.h \
 	gstomxvideoenc.h \
