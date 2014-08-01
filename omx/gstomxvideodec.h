@@ -83,6 +83,8 @@ struct _GstOMXVideoDec
   GstOMXPort *egl_in_port, *egl_out_port;
   gboolean eglimage;
 #endif
+
+  gboolean do_caps;
 };
 
 struct _GstOMXVideoDecClass

@@ -306,7 +306,8 @@ gst_omx_component_handle_messages (GstOMXComponent * comp)
           if (index == OMX_ALL || index == port->index) {
             port->settings_cookie++;
             gst_omx_port_update_port_definition (port, NULL);
-            if (port->port_def.eDir == OMX_DirOutput && !port->tunneled)
+            if (port->port_def.eDir == OMX_DirOutput &&
+                !gst_omx_port_is_tunneled (port))
               outports = g_list_prepend (outports, port);
           }
         }
@@ -596,7 +597,7 @@ EmptyBufferDone (OMX_HANDLETYPE hComponent, OMX_PTR pAppData,
 
   g_assert (buf->omx_buf == pBuffer);
 
-  if (buf->port->tunneled) {
+  if (gst_omx_port_is_tunneled (buf->port)) {
     GST_ERROR ("EmptyBufferDone on tunneled port");
     return OMX_ErrorBadParameter;
   }
@@ -634,7 +635,7 @@ FillBufferDone (OMX_HANDLETYPE hComponent, OMX_PTR pAppData,
 
   g_assert (buf->omx_buf == pBuffer);
 
-  if (buf->port->tunneled) {
+  if (gst_omx_port_is_tunneled (buf->port)) {
     GST_ERROR ("FillBufferDone on tunneled port");
     return OMX_ErrorBadParameter;
   }
@@ -937,7 +938,7 @@ gst_omx_component_add_port (GstOMXComponent * comp, guint32 index)
   port->comp = comp;
   port->index = index;
 
-  port->tunneled = FALSE;
+  port->peer = NULL;
 
   port->port_def = port_def;
 
@@ -1105,8 +1106,8 @@ gst_omx_setup_tunnel (GstOMXPort * port1, GstOMXPort * port2)
       port2->index);
 
   if (err == OMX_ErrorNone) {
-    port1->tunneled = TRUE;
-    port2->tunneled = TRUE;
+    port1->peer = port2;
+    port2->peer = port1;
   }
 
   GST_DEBUG_OBJECT (comp1->parent,
@@ -1138,7 +1139,8 @@ gst_omx_close_tunnel (GstOMXPort * port1, GstOMXPort * port2)
   comp2 = port2->comp;
 
   g_return_val_if_fail (comp1->core == comp2->core, OMX_ErrorUndefined);
-  g_return_val_if_fail (port1->tunneled && port2->tunneled, OMX_ErrorUndefined);
+  g_return_val_if_fail (port1->peer == port2, OMX_ErrorUndefined);
+  g_return_val_if_fail (port2->peer == port1, OMX_ErrorUndefined);
 
   g_mutex_lock (&comp1->lock);
   g_mutex_lock (&comp2->lock);
@@ -1159,8 +1161,8 @@ gst_omx_close_tunnel (GstOMXPort * port1, GstOMXPort * port2)
         gst_omx_error_to_string (err), err);
   }
 
-  port1->tunneled = FALSE;
-  port2->tunneled = FALSE;
+  port1->peer = NULL;
+  port2->peer = NULL;
 
   GST_DEBUG_OBJECT (comp1->parent,
       "Closed tunnel between %s port %u and %s port %u",
@@ -1226,7 +1228,6 @@ gst_omx_port_acquire_buffer (GstOMXPort * port, GstOMXBuffer ** buf)
   GstOMXBuffer *_buf = NULL;
 
   g_return_val_if_fail (port != NULL, GST_OMX_ACQUIRE_BUFFER_ERROR);
-  g_return_val_if_fail (!port->tunneled, GST_OMX_ACQUIRE_BUFFER_ERROR);
   g_return_val_if_fail (buf != NULL, GST_OMX_ACQUIRE_BUFFER_ERROR);
 
   *buf = NULL;
@@ -1315,6 +1316,11 @@ retry:
     goto done;
   }
 
+  if (gst_omx_port_is_tunneled (port)) {
+    gst_omx_component_wait_message (comp, GST_CLOCK_TIME_NONE);
+    goto retry;
+  }
+
   /* 
    * At this point we have no error or flushing/eos port
    * and a properly configured port.
@@ -1368,7 +1374,8 @@ gst_omx_port_release_buffer (GstOMXPort * port, GstOMXBuffer * buf)
   OMX_ERRORTYPE err = OMX_ErrorNone;
 
   g_return_val_if_fail (port != NULL, OMX_ErrorUndefined);
-  g_return_val_if_fail (!port->tunneled, GST_OMX_ACQUIRE_BUFFER_ERROR);
+  g_return_val_if_fail (!gst_omx_port_is_tunneled (port),
+      GST_OMX_ACQUIRE_BUFFER_ERROR);
   g_return_val_if_fail (buf != NULL, OMX_ErrorUndefined);
   g_return_val_if_fail (buf->port == port, OMX_ErrorUndefined);
 
@@ -1588,7 +1595,8 @@ gst_omx_port_allocate_buffers_unlocked (GstOMXPort * port,
 
   g_assert (!port->buffers || port->buffers->len == 0);
 
-  g_return_val_if_fail (!port->tunneled, OMX_ErrorBadParameter);
+  g_return_val_if_fail (!gst_omx_port_is_tunneled (port),
+      OMX_ErrorBadParameter);
 
   comp = port->comp;
 
@@ -1735,7 +1743,8 @@ gst_omx_port_deallocate_buffers_unlocked (GstOMXPort * port)
   OMX_ERRORTYPE err = OMX_ErrorNone;
   gint i, n;
 
-  g_return_val_if_fail (!port->tunneled, OMX_ErrorBadParameter);
+  g_return_val_if_fail (!gst_omx_port_is_tunneled (port),
+      OMX_ErrorBadParameter);
 
   comp = port->comp;
 
@@ -1983,13 +1992,21 @@ gst_omx_port_wait_buffers_released (GstOMXPort * port, GstClockTime timeout)
 OMX_ERRORTYPE
 gst_omx_port_set_enabled (GstOMXPort * port, gboolean enabled)
 {
+  GstOMXPort *peer;
   OMX_ERRORTYPE err;
 
   g_return_val_if_fail (port != NULL, OMX_ErrorUndefined);
 
   g_mutex_lock (&port->comp->lock);
+  peer = port->peer;
   err = gst_omx_port_set_enabled_unlocked (port, enabled);
   g_mutex_unlock (&port->comp->lock);
+
+  if (err == OMX_ErrorNone && peer) {
+    g_mutex_lock (&peer->comp->lock);
+    err = gst_omx_port_set_enabled_unlocked (peer, enabled);
+    g_mutex_unlock (&peer->comp->lock);
+  }
 
   return err;
 }
@@ -2023,7 +2040,8 @@ gst_omx_port_populate_unlocked (GstOMXPort * port)
     goto done;
   }
 
-  if (port->port_def.eDir == OMX_DirOutput && port->buffers && !port->tunneled) {
+  if (port->port_def.eDir == OMX_DirOutput && port->buffers &&
+      !gst_omx_port_is_tunneled (port)) {
     /* Enqueue all buffers for the component to fill */
     while ((buf = g_queue_pop_head (&port->pending_buffers))) {
       g_assert (!buf->used);
@@ -2164,13 +2182,21 @@ done:
 OMX_ERRORTYPE
 gst_omx_port_wait_enabled (GstOMXPort * port, GstClockTime timeout)
 {
+  GstOMXPort *peer;
   OMX_ERRORTYPE err;
 
   g_return_val_if_fail (port != NULL, OMX_ErrorUndefined);
 
   g_mutex_lock (&port->comp->lock);
+  peer = port->peer;
   err = gst_omx_port_wait_enabled_unlocked (port, timeout);
   g_mutex_unlock (&port->comp->lock);
+
+  if (err == OMX_ErrorNone && peer) {
+    g_mutex_lock (&peer->comp->lock);
+    err = gst_omx_port_wait_enabled_unlocked (peer, timeout);
+    g_mutex_unlock (&peer->comp->lock);
+  }
 
   return err;
 }
@@ -2189,6 +2215,12 @@ gst_omx_port_is_enabled (GstOMXPort * port)
       port->comp->name, port->index, enabled);
 
   return enabled;
+}
+
+gboolean
+gst_omx_port_is_tunneled (GstOMXPort * port)
+{
+  return port->peer != NULL;
 }
 
 /* NOTE: Uses comp->lock and comp->messages_lock */

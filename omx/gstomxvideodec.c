@@ -68,6 +68,8 @@ static gboolean gst_omx_video_dec_start (GstVideoDecoder * decoder);
 static gboolean gst_omx_video_dec_stop (GstVideoDecoder * decoder);
 static gboolean gst_omx_video_dec_set_format (GstVideoDecoder * decoder,
     GstVideoCodecState * state);
+static gboolean gst_omx_video_dec_sink_event (GstVideoDecoder * decoder,
+    GstEvent * event);
 static gboolean gst_omx_video_dec_flush (GstVideoDecoder * decoder);
 static GstFlowReturn gst_omx_video_dec_handle_frame (GstVideoDecoder * decoder,
     GstVideoCodecFrame * frame);
@@ -117,6 +119,8 @@ gst_omx_video_dec_class_init (GstOMXVideoDecClass * klass)
   video_decoder_class->flush = GST_DEBUG_FUNCPTR (gst_omx_video_dec_flush);
   video_decoder_class->set_format =
       GST_DEBUG_FUNCPTR (gst_omx_video_dec_set_format);
+  video_decoder_class->sink_event =
+      GST_DEBUG_FUNCPTR (gst_omx_video_dec_sink_event);
   video_decoder_class->handle_frame =
       GST_DEBUG_FUNCPTR (gst_omx_video_dec_handle_frame);
   video_decoder_class->finish = GST_DEBUG_FUNCPTR (gst_omx_video_dec_finish);
@@ -138,6 +142,8 @@ static void
 gst_omx_video_dec_init (GstOMXVideoDec * self)
 {
   gst_video_decoder_set_packetized (GST_VIDEO_DECODER (self), TRUE);
+
+  self->do_caps = FALSE;
 
   g_mutex_init (&self->drain_lock);
   g_cond_init (&self->drain_cond);
@@ -291,6 +297,10 @@ gst_omx_video_dec_shutdown (GstOMXVideoDec * self)
     gst_omx_video_dec_deallocate_output_buffers (self);
     if (state > OMX_StateLoaded)
       gst_omx_component_get_state (self->dec, 5 * GST_SECOND);
+  }
+
+  if (!self->eglimage && gst_omx_port_is_tunneled (self->dec_out_port)) {
+    gst_omx_close_tunnel (self->dec_out_port, self->dec_out_port->peer);
   }
 
   return TRUE;
@@ -839,8 +849,6 @@ gst_omx_video_dec_allocate_output_buffers (GstOMXVideoDec * self)
         goto done;
       }
     }
-
-
   }
 
   err = OMX_ErrorNone;
@@ -894,7 +902,7 @@ done:
 static OMX_ERRORTYPE
 gst_omx_video_dec_deallocate_output_buffers (GstOMXVideoDec * self)
 {
-  OMX_ERRORTYPE err;
+  OMX_ERRORTYPE err = OMX_ErrorNone;
 
   if (self->out_port_pool) {
     gst_buffer_pool_set_active (self->out_port_pool, FALSE);
@@ -907,10 +915,13 @@ gst_omx_video_dec_deallocate_output_buffers (GstOMXVideoDec * self)
   }
 #if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
   err =
-      gst_omx_port_deallocate_buffers (self->
-      eglimage ? self->egl_out_port : self->dec_out_port);
+      gst_omx_port_deallocate_buffers (self->eglimage ? self->
+      egl_out_port : self->dec_out_port);
 #else
-  err = gst_omx_port_deallocate_buffers (self->dec_out_port);
+  if (gst_omx_port_is_tunneled (self->dec_out_port))
+    err = gst_omx_port_set_enabled (self->dec_out_port, FALSE);
+  else
+    err = gst_omx_port_deallocate_buffers (self->dec_out_port);
 #endif
 
   return err;
@@ -919,6 +930,7 @@ gst_omx_video_dec_deallocate_output_buffers (GstOMXVideoDec * self)
 static OMX_ERRORTYPE
 gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
 {
+  GstBufferPool *pool;
   GstOMXPort *port;
   OMX_ERRORTYPE err;
   GstVideoCodecState *state;
@@ -1105,6 +1117,7 @@ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
     self->eglimage = FALSE;
   }
 #endif
+
   port = self->dec_out_port;
 
   /* Update caps */
@@ -1145,18 +1158,42 @@ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
 
   gst_video_codec_state_unref (state);
 
+  pool = gst_video_decoder_get_buffer_pool (GST_VIDEO_DECODER (self));
+
   GST_VIDEO_DECODER_STREAM_UNLOCK (self);
+
+  if (GST_IS_OMX_BUFFER_POOL (pool)) {
+    GstOMXBufferPool *op = GST_OMX_BUFFER_POOL (pool);
+
+    if ((err = gst_omx_setup_tunnel (port, op->port)) != OMX_ErrorNone) {
+      GST_WARNING_OBJECT (self, "Failed to setup tunnel: %s (0x%08x)",
+          gst_omx_error_to_string (err), err);
+    } else {
+
+    }
+  }
+  gst_object_unref (pool);
 
 #if defined (USE_OMX_TARGET_RPI) && defined (HAVE_GST_GL)
 enable_port:
 #endif
-  err = gst_omx_video_dec_allocate_output_buffers (self);
-  if (err != OMX_ErrorNone)
-    goto done;
 
-  err = gst_omx_port_populate (port);
-  if (err != OMX_ErrorNone)
-    goto done;
+  if (!gst_omx_port_is_tunneled (port)) {
+    err = gst_omx_video_dec_allocate_output_buffers (self);
+    if (err != OMX_ErrorNone) {
+      GST_WARNING_OBJECT (self,
+          "Failed to allocate output buffers: %s (0x%08x)",
+          gst_omx_error_to_string (err), err);
+      goto done;
+    }
+
+    err = gst_omx_port_populate (port);
+    if (err != OMX_ErrorNone) {
+      GST_WARNING_OBJECT (self, "Failed to populate port: %s (0x%08x)",
+          gst_omx_error_to_string (err), err);
+      goto done;
+    }
+  }
 
   err = gst_omx_port_mark_reconfigured (port);
   if (err != OMX_ErrorNone)
@@ -2057,6 +2094,34 @@ gst_omx_video_dec_set_format (GstVideoDecoder * decoder,
 }
 
 static gboolean
+gst_omx_video_dec_sink_event (GstVideoDecoder * decoder, GstEvent * event)
+{
+  gboolean ret = FALSE;
+  GstOMXVideoDec *self = GST_OMX_VIDEO_DEC (decoder);
+
+  GST_DEBUG_OBJECT (decoder, "handling event %p %" GST_PTR_FORMAT, event,
+      event);
+
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_CAPS:
+    {
+      self->do_caps = TRUE;
+      ret =
+          GST_VIDEO_DECODER_CLASS (gst_omx_video_dec_parent_class)->sink_event
+          (decoder, event);
+      break;
+    }
+    default:
+      ret =
+          GST_VIDEO_DECODER_CLASS (gst_omx_video_dec_parent_class)->sink_event
+          (decoder, event);
+      break;
+  }
+
+  return ret;
+}
+
+static gboolean
 gst_omx_video_dec_flush (GstVideoDecoder * decoder)
 {
   GstOMXVideoDec *self = GST_OMX_VIDEO_DEC (decoder);
@@ -2362,7 +2427,20 @@ gst_omx_video_dec_handle_frame (GstVideoDecoder * decoder,
       goto release_error;
   }
 
-  gst_video_codec_frame_unref (frame);
+  if (!self->eglimage && gst_omx_port_is_tunneled (self->dec_out_port)) {
+    if (self->do_caps || frame->events
+        || GST_VIDEO_CODEC_FRAME_IS_SYNC_POINT (frame)) {
+      self->do_caps = FALSE;
+      /* sometimes downstream element need a buffer to init its state
+       * or push synchronized event */
+      frame->output_buffer = gst_buffer_new ();
+      gst_video_decoder_finish_frame (GST_VIDEO_DECODER (self), frame);
+    } else {
+      gst_video_decoder_release_frame (GST_VIDEO_DECODER (self), frame);
+    }
+  } else {
+    gst_video_codec_frame_unref (frame);
+  }
 
   GST_DEBUG_OBJECT (self, "Passed frame to component");
 
@@ -2486,6 +2564,7 @@ gst_omx_video_dec_drain (GstOMXVideoDec * self, gboolean is_eos)
 
   g_mutex_lock (&self->drain_lock);
   self->draining = TRUE;
+
   buf->omx_buf->nFilledLen = 0;
   buf->omx_buf->nTimeStamp =
       gst_util_uint64_scale (self->last_upstream_ts, OMX_TICKS_PER_SECOND,
@@ -2517,6 +2596,7 @@ gst_omx_video_dec_drain (GstOMXVideoDec * self, gboolean is_eos)
   }
 
   g_mutex_unlock (&self->drain_lock);
+
   GST_VIDEO_DECODER_STREAM_LOCK (self);
 
   self->started = FALSE;

@@ -569,6 +569,8 @@ gst_omx_buffer_pool_finalize (GObject * object)
 {
   GstOMXBufferPool *pool = GST_OMX_BUFFER_POOL (object);
 
+  gst_buffer_pool_set_active (GST_BUFFER_POOL (object), FALSE);
+
   if (pool->element)
     gst_object_unref (pool->element);
   pool->element = NULL;
