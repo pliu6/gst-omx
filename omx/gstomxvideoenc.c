@@ -84,8 +84,7 @@ static gboolean gst_omx_video_enc_propose_allocation (GstVideoEncoder * encoder,
 static GstCaps *gst_omx_video_enc_getcaps (GstVideoEncoder * encoder,
     GstCaps * filter);
 
-static GstFlowReturn gst_omx_video_enc_drain (GstOMXVideoEnc * self,
-    gboolean at_eos);
+static GstFlowReturn gst_omx_video_enc_drain (GstOMXVideoEnc * self);
 
 static GstFlowReturn gst_omx_video_enc_handle_output_frame (GstOMXVideoEnc *
     self, GstOMXPort * port, GstOMXBuffer * buf, GstVideoCodecFrame * frame);
@@ -888,7 +887,6 @@ gst_omx_video_enc_start (GstVideoEncoder * encoder)
   self = GST_OMX_VIDEO_ENC (encoder);
 
   self->last_upstream_ts = 0;
-  self->eos = FALSE;
   self->downstream_flow_ret = GST_FLOW_OK;
 
   return TRUE;
@@ -913,7 +911,6 @@ gst_omx_video_enc_stop (GstVideoEncoder * encoder)
 
   self->downstream_flow_ret = GST_FLOW_FLUSHING;
   self->started = FALSE;
-  self->eos = FALSE;
 
   if (self->input_state)
     gst_video_codec_state_unref (self->input_state);
@@ -957,7 +954,7 @@ gst_omx_video_enc_set_format (GstVideoEncoder * encoder,
    */
   if (needs_disable) {
     GST_DEBUG_OBJECT (self, "Need to disable and drain encoder");
-    gst_omx_video_enc_drain (self, FALSE);
+    gst_omx_video_enc_drain (self);
     gst_omx_port_set_flushing (self->enc_out_port, 5 * GST_SECOND, TRUE);
 
     /* Wait until the srcpad loop is finished,
@@ -1231,7 +1228,6 @@ gst_omx_video_enc_flush (GstVideoEncoder * encoder)
 
   /* Start the srcpad loop again */
   self->last_upstream_ts = 0;
-  self->eos = FALSE;
   self->downstream_flow_ret = GST_FLOW_OK;
   gst_pad_start_task (GST_VIDEO_ENCODER_SRC_PAD (self),
       (GstTaskFunction) gst_omx_video_enc_loop, encoder, NULL);
@@ -1418,12 +1414,6 @@ gst_omx_video_enc_handle_frame (GstVideoEncoder * encoder,
   self = GST_OMX_VIDEO_ENC (encoder);
 
   GST_DEBUG_OBJECT (self, "Handling frame");
-
-  if (self->eos) {
-    GST_WARNING_OBJECT (self, "Got frame after EOS");
-    gst_video_codec_frame_unref (frame);
-    return GST_FLOW_EOS;
-  }
 
   if (self->downstream_flow_ret != GST_FLOW_OK) {
     gst_video_codec_frame_unref (frame);
@@ -1636,11 +1626,11 @@ gst_omx_video_enc_finish (GstVideoEncoder * encoder)
 
   self = GST_OMX_VIDEO_ENC (encoder);
 
-  return gst_omx_video_enc_drain (self, TRUE);
+  return gst_omx_video_enc_drain (self);
 }
 
 static GstFlowReturn
-gst_omx_video_enc_drain (GstOMXVideoEnc * self, gboolean at_eos)
+gst_omx_video_enc_drain (GstOMXVideoEnc * self)
 {
   GstOMXVideoEncClass *klass;
   GstOMXBuffer *buf;
@@ -1656,14 +1646,6 @@ gst_omx_video_enc_drain (GstOMXVideoEnc * self, gboolean at_eos)
     return GST_FLOW_OK;
   }
   self->started = FALSE;
-
-  /* Don't send EOS buffer twice, this doesn't work */
-  if (self->eos) {
-    GST_DEBUG_OBJECT (self, "Component is EOS already");
-    return GST_FLOW_OK;
-  }
-  if (at_eos)
-    self->eos = TRUE;
 
   if ((klass->cdata.hacks & GST_OMX_HACK_NO_EMPTY_EOS_BUFFER)) {
     GST_WARNING_OBJECT (self, "Component does not support empty EOS buffers");
